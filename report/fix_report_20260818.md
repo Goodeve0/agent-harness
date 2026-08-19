@@ -1,7 +1,7 @@
-# AgentHarness MVP 修复报告
+# AgentHarness 修复报告
 
 日期：2026-08-18
-对应审查：`report/code_review_mvp_20260818.md`
+对应审查：`report/code_review_20260818.md`
 验证：pytest **50 passed**（30 原有 + 20 新增回归测试）+ 双任务 mock 实跑
 
 ---

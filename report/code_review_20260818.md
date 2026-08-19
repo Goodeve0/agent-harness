@@ -1,4 +1,4 @@
-# AgentHarness MVP 代码审查报告
+# AgentHarness 代码审查报告
 
 - **审查日期**: 2026-08-18
 - **范围**: 全部 6 个模块（harness / metrics / dataset / report / strategies / tasks）+ 主入口

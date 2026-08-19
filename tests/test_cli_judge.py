@@ -1,5 +1,5 @@
 """
-CLI judge（Claude Code / Codex）双模型交叉评测 MVP 测试
+CLI judge（Claude Code / Codex）双模型交叉评测测试
 
 覆盖：
   · 两种后端命令构造（claude -p / codex exec）

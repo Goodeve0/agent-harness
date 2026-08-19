@@ -1,4 +1,4 @@
-# Claude Code + Codex 双模型交叉评测 MVP
+# Claude Code + Codex 双模型交叉评测
 
 日期：2026-08-18
 状态：✅ 代码落地 + 69 测试全绿；⚠️ 真实 CLI 评分需配 API Key 后实测（本机 codex 已装、claude 未装）
@@ -7,7 +7,7 @@
 
 ## 1. 背景
 
-核验发现原 `--cross-check` 两侧 judge 都是 OpenAI client（`gpt-4o-mini × gpt-4o`），与简历"Claude Code + Codex 双模型交叉校验"不符且从未实测。本 MVP 补齐真实异构后端。
+核验发现原 `--cross-check` 两侧 judge 都是 OpenAI client（`gpt-4o-mini × gpt-4o`），与简历"Claude Code + Codex 双模型交叉校验"不符且从未实测。本实现补齐真实异构后端。
 
 ## 2. 设计
 

@@ -42,7 +42,7 @@
 
 ---
 
-## 3. 模型交叉评测 ✅ 框架 + CLI 后端 MVP 已落地（需真配 Key 实测一次）
+## 3. 模型交叉评测 ✅ 框架 + CLI 后端已落地（需真配 Key 实测一次）
 
 **简历陈述**：落地 Claude Code + Codex 双模型交叉校验机制，结合 Trace 分析优化评测链路，定位 Agent 执行过程中的工具调用及结果偏差，归因交付周期由周级压缩至小时级
 
@@ -56,15 +56,15 @@
 | 单测覆盖 | ✅ | `tests/test_fixes.py`（valid-only / dispute-conservative / agreement-mean）+ `tests/test_cli_judge.py` 新增 19 个（命令构造 / 四级解析 / fail-open 四场景 / probe / 集成仲裁） |
 | 结合 Trace 定位偏差 | ✅ | Trace 全量落盘（tracer.dump_traces）+ 规则层 failed check 逐条归因 + suggestion 改进建议 |
 
-**MVP 落地记录（本轮）**：
+**落地记录（本轮）**：
 - 新文件 `metrics/cli_judge.py`：CLIJudge（claude/codex 两种后端）+ `parse_cli_score`（JSON → 分数表达式 → 百分比 → 0-1 数字四级解析）+ `probe_cli` 探测。
 - 修复 `cross_validator._safe_judge` 真 bug：judge 返回 -1 曾被 `0.0 if s < 0` 转成 0 分（把"无法判定"当"0 分"拉低仲裁），现已保留 -1 语义。
 - 本机探测（2026-08-18）：`codex` CLI 已装（0.147.0），`claude` CLI 未装（探测即 fail-open 降级，设计内行为）。
-- 使用文档：`report/claude_codex_cross_judge_mvp_20260818.md`，含 3 条运行命令 + 面试表述收紧版。
+- 使用文档：`report/claude_codex_cross_judge_20260818.md`，含 3 条运行命令 + 面试表述收紧版。
 
 **⚠️ 剩余诚实边界（不是代码问题，是证据问题）**：
 1. 真实模型评分需要 API Key：claude CLI 需安装 + `ANTHROPIC_API_KEY`；codex 本机已具备环境。建议配 Key 后跑一次 `--judge-a-backend claude --judge-b-backend codex` 留一份报告 JSON 作为面试证据。
-2. **"归因交付周期由周级压缩至小时级"无数据支撑**，已从面试表述中移除（见 MVP 文档 §7 收紧版）。
+2. **"归因交付周期由周级压缩至小时级"无数据支撑**，已从面试表述中移除（见交叉评测文档 §7 收紧版）。
 
 ---
 
@@ -92,7 +92,7 @@
 |---|---|---|
 | 1. 双层评测 | 基本落地，可加 L1/L2/L3 分层权重亮点 | 🟢 无 |
 | 2. Strategy 插件机制 | 完全落地，最扎实的一个 | 🟢 无 |
-| 3. 双模型交叉评测 | 框架 + Claude/Codex CLI 后端 MVP 已落地（69 测试全绿）；真实评分需配 Key 实测一次 | 🟡 需配 Key 实证 |
+| 3. 双模型交叉评测 | 框架 + Claude/Codex CLI 后端已落地（69 测试全绿）；真实评分需配 Key 实测一次 | 🟡 需配 Key 实证 |
 | 4. 评测数据闭环 | 落地，旧污染数据已清空，回归集从干净状态开始 | 🟢 无 |
 
 **面试优先级**：维度 2 可放心讲；维度 1 建议补"分层权重"细节；维度 3 代码已可讲（CLI 后端 + fail-open 降级 + 仲裁），配 Key 真跑一次留证据更稳；维度 4 已干净可直接讲。

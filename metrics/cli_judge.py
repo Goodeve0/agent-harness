@@ -1,5 +1,5 @@
 """
-Claude Code / Codex CLI 双模型交叉评测 MVP（metrics/cli_judge.py）
+Claude Code / Codex CLI 双模型交叉评测（metrics/cli_judge.py）
 
 背景：
   原 cross-check 两侧都是 OpenAI client（gpt-4o-mini × gpt-4o），与简历声称的
