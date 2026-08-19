@@ -43,6 +43,11 @@ PATTERN_PROMPT = """你是一个严谨的分类判断评委。请判断以下输
 请只输出 YES 或 NO，不输出任何额外内容。"""
 
 
+def _clamp01(v: float) -> float:
+    """clamp 到 [0, 1]，防止模型输出越界值污染评分"""
+    return max(0.0, min(1.0, v))
+
+
 class LLMJudge:
     """
     LLM-as-Judge，支持两种模式：
@@ -95,33 +100,54 @@ class LLMJudge:
             return self._parse_pattern(raw)
 
     def _parse_numeric(self, raw: str) -> float:
+        """从 LLM 输出中稳健提取 0~1 分，对格式漂移做容错（业界惯例：正则
+        提取 + clamp + 分制推断，参考生产级 extract_score 实现思路）。
+
+        解析顺序：
+          1. 分数表达式  "8/10"、"0.8/1"          → 相除后 clamp
+          2. 百分比      "85%"                    → /100
+          3. 中文分制    "8分"→0.8、"85分"→0.85   → N>1 才推断分制（<=1 交给 [0,1] 分支）
+          4. 0~1 连续数字（评分通常在末尾，从后往前取）
+          5. 兜底分制推断：漏写小数点的 "85"→0.85；10 分制的 "8"→0.8；更大值 clamp 到 1.0
+        """
         if not raw or not raw.strip():
             return 0.0
 
-        # 分数表达式：8/10、0.8/1 → 0.8
+        # 1) 分数表达式：8/10、0.8/1 → 0.8
         m = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", raw)
         if m:
             denom = float(m.group(2))
             if denom > 0:
-                return max(0.0, min(1.0, float(m.group(1)) / denom))
-        # 百分比：85% → 0.85
+                return _clamp01(float(m.group(1)) / denom)
+        # 2) 百分比：85% → 0.85
         m = re.search(r"(\d+(?:\.\d+)?)\s*%", raw)
         if m:
-            return max(0.0, min(1.0, float(m.group(1)) / 100.0))
-
-        # 取所有数字串，从后往前找第一个落在 [0,1] 的（评分通常在末尾，
-        # 且能避免误匹配"3 个维度"这类前缀数字）
+            return _clamp01(float(m.group(1)) / 100.0)
+        # 3) 中文分制："我打 8 分（满分 10）" → 0.8；只处理 >1，避免 "0.8 分" 被误 /10
+        for tok in reversed(re.findall(r"(\d+(?:\.\d+)?)\s*分", raw)):
+            v = float(tok)
+            if v > 1.0:
+                return _clamp01(round(v / 100.0, 4) if v > 10.0 else round(v / 10.0, 4))
+        # 4) 取所有数字串，从后往前找第一个落在 [0,1] 的（评分通常在末尾，
+        #    且能避免误匹配"3 个维度"这类前缀数字）
         candidates = re.findall(r"\d+(?:\.\d+)?", raw)
         for tok in reversed(candidates):
             v = float(tok)
             if 0.0 <= v <= 1.0:
                 return v
-        # 无 0-1 范围的值时，取最后一个数字并 clamp（如 85 表示 0.85 被漏写小数点）
+        # 5) 兜底分制推断：先排除"3 个维度"这类计数场景（非评分，不伪造分数，
+        #    与 CLI 后端 parse_cli_score 对"出错了 2 个维度"判无法解析的语义一致）；
+        #    此处的数字必 >1（<=1 已被第 4 步返回），
+        #    "85"（漏写小数点）→ 0.85；"8"（10 分制）→ 0.8；更大值 clamp 到 1.0
+        if re.search(r"\d+(?:\.\d+)?\s*(?:个|维度|次|条|步)", raw):
+            return 0.0
         for tok in reversed(candidates):
             v = float(tok)
-            if v > 1.0:
-                return 1.0
-            return v
+            if v <= 10.0:
+                return round(v / 10.0, 4)
+            if v <= 100.0:
+                return round(v / 100.0, 4)
+            return 1.0
         return 0.0
 
     def _parse_pattern(self, raw: str) -> float:

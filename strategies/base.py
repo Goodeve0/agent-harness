@@ -58,3 +58,13 @@ class BaseStrategy(ABC):
 
     def extract_action(self, response_message: dict) -> tuple[str, dict[str, Any]] | None:
         return None
+
+    def format_error_feedback(self, response_message: dict) -> str | None:
+        """文本协议策略（如 ReAct）格式漂移时的纠错反馈。
+
+        AgentLoop 在 extract_action 返回 None 且本轮未结束时会调用：
+          返回非 None → 作为 Observation 回灌给模型，让其修正格式后重试
+          返回 None   → 视为纯文本中间回复，继续循环（不打断）
+        Function Calling 等原生工具策略无需文本协议纠错，保持默认 None。
+        """
+        return None

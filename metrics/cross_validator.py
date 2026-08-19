@@ -140,8 +140,23 @@ class CrossValidator:
     # ── 一致性报告 ────────────────────────────────────────────────────────────
     def report(self) -> dict:
         valid_recs = [r for r in self.records if r.valid]
+        # fail-open：两侧 CLI 均不可用时（-1/-1），报告也必须返回结构完整的
+        # dict，调用方（run_eval 等）按协议索引不崩。与 judge 侧 -1 语义一致：
+        # 不可用 ≠ 0 分，指标全部归零但键齐全，verdict 走"一致率偏低"路径提示。
+        empty = {
+            "total": 0,
+            "model_a": getattr(self.judge_a, "judge_model", "model_a"),
+            "model_b": getattr(self.judge_b, "judge_model", "model_b"),
+            "agreement_rate": 0.0,
+            "mean_abs_diff": 0.0,
+            "mean_score_a": 0.0,
+            "mean_score_b": 0.0,
+            "disputed_count": 0,
+            "disputed_samples": [],
+            "verdict": self._verdict(0.0),
+        }
         if not valid_recs:
-            return {"total": 0, "agreement_rate": 0.0}
+            return empty
 
         n = len(valid_recs)
         agreed = sum(1 for r in valid_recs if r.agreed)

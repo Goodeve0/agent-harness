@@ -71,6 +71,10 @@ class AgentTrace:
             "sample_id": self.sample_id,
             "agent_id": self.agent_id,
             "prompt_version": self.prompt_version,
+            # 完整对话历史：OpenAI Evals trace grading 要求 trace = input + 有序
+            # steps（每个 reasoning / tool_call / tool_result）+ final output，
+            # 仅记录 steps 无法回放多轮对话，也无法对消息级行为做断言。
+            "messages": self.messages,
             "steps": [
                 {
                     "step": s.step,
