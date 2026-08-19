@@ -1,0 +1,52 @@
+name: Agent Eval Gate
+
+# Agent Prompt 变更时自动触发评测，未达标则阻塞合并
+on:
+  pull_request:
+    paths:
+      - 'tasks/**/*.yaml'
+      - 'harness/**'
+      - 'strategies/**'
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    env:
+      # 提到 job 级，使 step 的 if 条件能正确求值
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: pytest tests/ -q
+
+      # 规则层评测：零 LLM 成本，秒级完成，可在每个 PR 上跑
+      - name: Rule-layer eval (no LLM cost)
+        run: |
+          python run_eval.py --task tasks/content_pipeline/task.yaml \
+            --runs 3 --mock-run --ci --threshold 0.8
+          python run_eval.py --task tasks/customer_service/task.yaml \
+            --runs 3 --mock-run --ci --threshold 0.8
+
+      # 完整评测（含 LLM Judge）：仅在有 Key 时执行
+      - name: Full eval with LLM Judge
+        if: ${{ env.OPENAI_API_KEY != '' }}
+        run: |
+          python run_eval.py --task tasks/content_pipeline/task.yaml \
+            --runs 3 --ci --threshold 0.8
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            report/output/
+            report/traces/

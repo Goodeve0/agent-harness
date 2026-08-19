@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# Eval output (generated, not source)
+report/output/
+dataset/golden_set.jsonl
+
+# Local tooling / IDE caches
+.workbuddy/
+.pytest_cache/
+.codeflicker/
+.harness/
+*.log

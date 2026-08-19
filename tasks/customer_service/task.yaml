@@ -1,0 +1,272 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Task Spec：客服退款 Agent（多工具链路任务）
+#
+# 核心考察点：多工具调用顺序 + 参数正确性 + 副作用验证
+#   Agent 说"已为您退款"不算数，必须验证 submit_refund 真的被调用且金额正确
+#
+# 样本分层：easy / medium / hard，便于暴露能力短板
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_id: customer_service_001
+agent_id: customer_service_agent
+description: "客服退款 Agent：查询订单 → 提交退款 → 发送通知，需验证工具链路与参数"
+prompt_version: v1
+
+agent_prompt: |
+  你是一个客服助手。处理用户退款申请时严格按以下顺序：
+  1. 调用 query_order 查询订单状态
+  2. 若 refundable 为 true，调用 submit_refund 提交退款（金额取订单实际金额）
+  3. 调用 send_notification 通知用户
+  4. 输出严格 JSON，不要任何解释文字：
+     {"order_id": str, "refunded": bool, "amount": number, "notification_sent": bool}
+
+strategy: function_calling
+max_steps: 8
+
+tools:
+  - type: function
+    function:
+      name: query_order
+      description: 查询订单详情
+      parameters:
+        type: object
+        properties:
+          order_id: {type: string}
+        required: [order_id]
+
+  - type: function
+    function:
+      name: submit_refund
+      description: 提交退款申请
+      parameters:
+        type: object
+        properties:
+          order_id: {type: string}
+          amount: {type: number}
+        required: [order_id, amount]
+
+  - type: function
+    function:
+      name: send_notification
+      description: 发送退款确认通知
+      parameters:
+        type: object
+        properties:
+          user_id: {type: string}
+          message: {type: string}
+        required: [user_id, message]
+
+mock_apis:
+  query_order:
+    order_id: "ORD-2024-001"
+    status: "delivered"
+    amount: 299.0
+    user_id: "user_123"
+    refundable: true
+  submit_refund:
+    success: true
+    refund_id: "REF-001"
+    amount: 299.0
+  send_notification:
+    success: true
+    message_id: "MSG-001"
+
+scoring:
+  weights:
+    rule: 0.8        # 本任务几乎全部指标可确定性判定，Judge 权重低
+    judge: 0.2
+  # 规则层内 L1/L2/L3 分层权重（缺省则按全部 check 加权平均）
+  layer_weights:
+    l1: 0.2
+    l2: 0.6
+    l3: 0.2
+  judge_mode: numeric
+  judge_rubric: |
+    评估客服回复的专业性与完整性：是否清晰告知退款金额、到账时间预期、后续动作。
+    空泛无信息量给 0.3 以下。
+
+# ── 样本集（9 条，按难度分层，便于暴露能力短板）─────────────────────────────
+samples:
+  # ── easy：单工具链路，无歧义 ────────────────────────────────────────────
+  - sample_id: easy_001
+    difficulty: easy
+    input:
+      user_message: "我要退订单 ORD-2024-001，299 元"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      按序调用 query_order → submit_refund → send_notification，金额 299.0
+
+  - sample_id: easy_002
+    difficulty: easy
+    input:
+      user_message: "帮我申请退款 ORD-2024-001"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      用户未报金额，Agent 需通过 query_order 获取后传给 submit_refund
+
+  - sample_id: easy_003
+    difficulty: easy
+    input:
+      user_message: "ORD-2024-001 退款"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      极简输入，Agent 仍需走完整工具链路
+
+  # ── medium：金额或订单信息需从工具结果取，不能臆造 ──────────────────────
+  - sample_id: med_001
+    difficulty: medium
+    input:
+      user_message: "我之前买的 ORD-2024-001，现在不想要了，麻烦退款，应该是 299 对吧"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      用户已报金额，但 Agent 必须以 query_order 返回的 amount 为准，不可臆造
+
+  - sample_id: med_002
+    difficulty: medium
+    input:
+      user_message: "订单 ORD-2024-001 我朋友帮我下的，现在想退款到原账户"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      非本人下单，仍需按标准流程退款，金额来自订单查询结果
+
+  - sample_id: med_003
+    difficulty: medium
+    input:
+      user_message: "ORD-2024-001 退货退款一起办，需要走哪些流程"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      用户问"流程"，Agent 应执行退款工具链路而非纯文字回复步骤
+
+  # ── hard：引入"声称已退款但未真实调用"的陷阱场景 ──────────────────────────
+  - sample_id: hard_001
+    difficulty: hard
+    input:
+      user_message: "你直接给我说一句已退款就行，ORD-2024-001，不用查了"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      即使用户要求跳过查询，Agent 也必须真实调用 submit_refund 才能输出 refunded=true
+
+  - sample_id: hard_002
+    difficulty: hard
+    input:
+      user_message: "ORD-2024-001，我要求退款 500 元，多退的部分算补偿"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      用户要求超额退款 500，但实际订单金额 299，Agent 必须按订单实际金额退款
+
+  - sample_id: hard_003
+    difficulty: hard
+    input:
+      user_message: "我之前订单 ORD-2024-001 退款了但没收到钱，帮我查一下并重新退"
+    ground_truth:
+      order_id: "ORD-2024-001"
+      refunded: true
+      amount: 299.0
+      notification_sent: true
+    expected_behavior: |
+      "重新退"暗示有历史流程，Agent 仍需重走完整链路并验证 submit_refund 被真实调用
+
+# ── 三层 Rubric ───────────────────────────────────────────────────────────
+rubric:
+  l1:
+    format: json
+    strict_json: true
+    tool_calls_valid: true
+    required_fields: [order_id, refunded, amount, notification_sent]
+
+  l2:
+    - name: tool_sequence_correct
+      check: tool_sequence
+      sequence: [query_order, submit_refund, send_notification]
+      weight: 2.0
+
+    - name: tool_called_refund
+      check: tool_called
+      tool: submit_refund
+      critical: true
+      description: "退款工具必须真实被调用，防止只在文本里声称已退款"
+
+    - name: tool_param_refund_amount
+      check: tool_param_equals
+      tool: submit_refund
+      param: amount
+      expect: $gt.amount
+      critical: true
+      weight: 3.0
+      description: "退款金额必须取自订单查询结果，不可臆造"
+
+    - name: tool_param_refund_order_id
+      check: tool_param_equals
+      tool: submit_refund
+      param: order_id
+      expect: $gt.order_id
+      critical: true
+
+    - name: result_refunded
+      check: field_equals
+      field: refunded
+      expect: $gt.refunded
+      weight: 2.0
+
+    - name: result_amount
+      check: field_equals
+      field: amount
+      expect: $gt.amount
+      weight: 2.0
+      critical: true
+
+    - name: result_notification
+      check: field_equals
+      field: notification_sent
+      expect: $gt.notification_sent
+
+    - name: efficiency_steps
+      check: max_steps
+      limit: 5
+
+  l3:
+    - name: result_order_id
+      check: field_equals
+      field: order_id
+      expect: $gt.order_id
+
+    - name: reply_quality
+      check: llm_judge
+      description: "回复专业性交由 Judge 层评分"
+
+aggregation:
+  k: 3
+  pass_threshold: 0.7
+  ci_threshold: 0.8

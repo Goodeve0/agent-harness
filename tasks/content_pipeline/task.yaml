@@ -1,0 +1,231 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Task Spec：内容审核 Agent（内容生成多 Agent 链路第 2 环）
+#
+# 链路：[图片理解] → [内容审核] ← 本 Spec → [文案生成] → [风格匹配]
+#
+# 评测范式：Prompt → Expected Behavior → Trace 三元组
+#   不只看"最终答案对不对"，而看"执行路径是否符合预期行为"
+#
+# 样本分层：easy / medium / hard
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_id: content_review_001
+agent_id: content_review_agent
+description: "内容审核 Agent：判断商品内容是否违规，输出过滤决策与质量评分"
+prompt_version: v1
+
+agent_prompt: |
+  你是一个内容审核助手。给定商品内容，你需要：
+  1. 调用 review_content 工具获取各维度审核评分
+  2. 根据 total_mock_score 决定是否过滤（低于 50 分则过滤）
+  3. 输出严格的 JSON，不要任何解释文字：
+     {"should_filter": bool, "total_score": int, "reason": str}
+
+strategy: function_calling
+max_steps: 5
+
+tools:
+  - type: function
+    function:
+      name: review_content
+      description: 审核商品内容，返回各维度评分
+      parameters:
+        type: object
+        properties:
+          content:
+            type: string
+            description: 待审核的商品文案内容
+        required: [content]
+
+mock_apis:
+  review_content:
+    # 条件 mock：根据 content 是否含违禁词返回不同分数
+    # 含违禁词 → 低分（触发过滤）；否则 → 高分（不过滤）
+    # 与各样本 ground_truth 的 expected_range 对齐
+    _conditional:
+      - if: {content_contains_any: ["高仿", "假冒", "正品保证", "绝对值", "假一赔"]}
+        return:
+          dimension_compliance: 8
+          dimension_quality: 12
+          dimension_relevance: 10
+          total_mock_score: 30
+          has_violations: true
+      - default:
+          dimension_compliance: 22
+          dimension_quality: 22
+          dimension_relevance: 20
+          total_mock_score: 64
+          has_violations: false
+
+scoring:
+  weights:
+    rule: 0.7
+    judge: 0.3
+  # 规则层内 L1/L2/L3 分层权重（缺省则按全部 check 加权平均）
+  layer_weights:
+    l1: 0.2
+    l2: 0.6
+    l3: 0.2
+  judge_mode: numeric
+  judge_rubric: |
+    评估审核理由（reason 字段）的质量：
+    - 是否明确指出判断依据（使用了具体维度分数）
+    - 是否逻辑自洽（结论与分数一致）
+    - 是否简洁无冗余
+    满分 1.0，逻辑矛盾或空泛套话给 0.3 以下。
+
+# ── 样本集（9 条，按难度分层）─────────────────────────────────────────────
+samples:
+  # ── easy：无违禁词，分数清晰 ───────────────────────────────────────────
+  - sample_id: easy_001
+    difficulty: easy
+    input:
+      content: "XX品牌零食合集，最近发现了这些超好吃的零食，强烈推荐！"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      Agent 调用 review_content，total_mock_score=64 > 50，判定不过滤
+
+  - sample_id: easy_002
+    difficulty: easy
+    input:
+      content: "推荐一款好用的蓝牙耳机，音质不错续航也长。"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      无违禁词，Agent 应直接调用工具并返回不过滤
+
+  - sample_id: easy_003
+    difficulty: easy
+    input:
+      content: "新款运动鞋上市，透气网面设计，适合夏季跑步。"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      无违禁词，Agent 应走标准审核流程
+
+  # ── medium：含违禁词，过滤逻辑需触发 ───────────────────────────────────
+  - sample_id: med_001
+    difficulty: medium
+    input:
+      content: "超便宜！高仿品牌包包，一模一样，绝对值！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      含"高仿"违禁词，Agent 应优先过滤，即使工具返回分数偏高
+
+  - sample_id: med_002
+    difficulty: medium
+    input:
+      content: "正品保证，假冒一赔十，快来抢购！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      "假冒"违禁词，应过滤；Agent 输出不得复述该词
+
+  - sample_id: med_003
+    difficulty: medium
+    input:
+      content: "绝对值！这款手机保证正品，假一赔三，数量有限！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      "假一赔三"暗示存在仿冒风险，应过滤
+
+  # ── hard：边界情况，分数与违禁词冲突 ──────────────────────────────────
+  - sample_id: hard_001
+    difficulty: hard
+    input:
+      content: "这款商品虽然质量一般，但价格极低，性价比超高，绝对值！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      无明显违禁词但"绝对值"是夸大宣传，应基于低分过滤
+
+  - sample_id: hard_002
+    difficulty: hard
+    input:
+      content: "进口商品，质量保证，但有用户反馈与描述不符，建议谨慎购买。"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      含负面反馈但无违禁词，应基于评分 64 判定不过滤
+
+  - sample_id: hard_003
+    difficulty: hard
+    input:
+      content: "秒杀！限时抢购！这款高仿运动鞋，质量媲美正品，手慢无！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      含"高仿"违禁词，必须过滤；Agent 输出不得复述该词
+
+rubric:
+  l1:
+    format: json
+    strict_json: true
+    tool_calls_valid: true
+    required_fields: [should_filter, total_score, reason]
+
+  l2:
+    - name: tool_called_review
+      check: tool_called
+      tool: review_content
+
+    - name: tool_param_content_passed
+      check: tool_param_equals
+      tool: review_content
+      param: content
+      expect: $gt.input_content
+
+    - name: filter_decision_correct
+      check: field_equals
+      field: should_filter
+      expect: $gt.should_filter
+      weight: 2.0
+      critical: true
+
+    - name: score_in_range
+      check: field_in_range
+      field: total_score
+      range: $gt.expected_range
+
+    - name: efficiency_steps
+      check: max_steps
+      limit: 3
+
+  l3:
+    - name: reason_non_empty
+      check: field_non_empty
+      field: reason
+
+    - name: no_violation_output
+      check: regex_absent
+      pattern: "(高仿|假冒|正品保证|绝对值|假一赔)"
+      critical: true
+
+    - name: reason_semantic_quality
+      check: llm_judge
+
+aggregation:
+  k: 3
+  pass_threshold: 0.6
+  ci_threshold: 0.8
