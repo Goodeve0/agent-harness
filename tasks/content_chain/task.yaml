@@ -1,0 +1,261 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Task Spec：内容审核多 Agent 协作链路（初审 → 终审 两环）
+#
+# 链路：[初审 Agent: content_review_agent] → [终审 Agent: content_approval_agent]
+#   · 初审：调用 review_content 判断内容是否违规，输出中间审核结论
+#   · 终审：接收上游初审结论作为上下文，复核后输出最终过滤决策
+#
+# 评测范式：整条链的 trace 合并评分（rules 层对全链路轨迹 check），
+#   无需为多 Agent 改造 rubric；mock 模式每环各自注入缺陷，验证规则层
+#   能穿透链路捕获并归因。
+# ─────────────────────────────────────────────────────────────────────────────
+
+task_id: content_chain_001
+chain_id: content_chain_v1
+description: "内容审核协作链路：初审识别违规 → 终审复核决策"
+prompt_version: v1
+
+agents:
+  # ── 第一环：初审 ────────────────────────────────────────────────────────
+  - agent_id: content_review_agent
+    description: "初审：判断商品内容是否违规，输出中间审核结论"
+    agent_prompt: |
+      你是内容初审助手。给定商品内容，你需要：
+      1. 调用 review_content 工具获取各维度审核评分
+      2. 根据 total_mock_score 决定是否过滤（低于 50 分则过滤）
+      3. 输出中间审核结论 JSON：
+         {"should_filter": bool, "total_score": int, "reason": str}
+    strategy: function_calling
+    max_steps: 5
+    tools:
+      - type: function
+        function:
+          name: review_content
+          description: 审核商品内容，返回各维度评分
+          parameters:
+            type: object
+            properties:
+              content:
+                type: string
+                description: 待审核的商品文案内容
+            required: [content]
+    mock_apis:
+      review_content:
+        _conditional:
+          - if: {content_contains_any: ["高仿", "假冒", "正品保证", "绝对值", "假一赔"]}
+            return:
+              dimension_compliance: 8
+              dimension_quality: 12
+              dimension_relevance: 10
+              total_mock_score: 30
+              has_violations: true
+          - default:
+              dimension_compliance: 22
+              dimension_quality: 22
+              dimension_relevance: 20
+              total_mock_score: 64
+              has_violations: false
+
+  # ── 第二环：终审 ────────────────────────────────────────────────────────
+  - agent_id: content_approval_agent
+    description: "终审：结合初审结论复核，输出最终过滤决策"
+    agent_prompt: |
+      你是内容终审助手。上游初审 Agent 已给出审核结论，你需要复核并做最终决策：
+      1. 调用 finalize_review 工具提交最终决策（should_filter / total_score / reason）
+      2. 输出严格 JSON，不要任何解释文字：
+         {"should_filter": bool, "total_score": int, "reason": str}
+    strategy: function_calling
+    max_steps: 5
+    tools:
+      - type: function
+        function:
+          name: finalize_review
+          description: 提交内容审核最终决策
+          parameters:
+            type: object
+            properties:
+              should_filter:
+                type: boolean
+                description: 是否过滤该商品内容
+              total_score:
+                type: integer
+                description: 综合评分
+              reason:
+                type: string
+                description: 决策理由
+            required: [should_filter, total_score, reason]
+    mock_apis:
+      finalize_review:
+        accepted: true
+
+scoring:
+  weights:
+    rule: 0.7
+    judge: 0.3
+  layer_weights:
+    l1: 0.2
+    l2: 0.6
+    l3: 0.2
+  judge_mode: numeric
+  judge_rubric: |
+    评估终审理由（reason 字段）的质量：
+    - 是否明确指出判断依据（使用了具体维度分数）
+    - 是否逻辑自洽（结论与分数一致）
+    - 是否简洁无冗余
+    满分 1.0，逻辑矛盾或空泛套话给 0.3 以下。
+
+# ── 样本集（9 条，按难度分层）─────────────────────────────────────────────
+samples:
+  # ── easy：无违禁词，分数清晰 ───────────────────────────────────────────
+  - sample_id: easy_001
+    difficulty: easy
+    input:
+      content: "XX品牌零食合集，最近发现了这些超好吃的零食，强烈推荐！"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      初审调用 review_content 得到 64 分，终审复核后判定不过滤
+
+  - sample_id: easy_002
+    difficulty: easy
+    input:
+      content: "推荐一款好用的蓝牙耳机，音质不错续航也长。"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      无违禁词，链路两端均走标准流程并输出不过滤
+
+  - sample_id: easy_003
+    difficulty: easy
+    input:
+      content: "新款运动鞋上市，透气网面设计，适合夏季跑步。"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      无违禁词，终审基于初审结论输出不过滤
+
+  # ── medium：含违禁词，过滤逻辑需触发 ───────────────────────────────────
+  - sample_id: med_001
+    difficulty: medium
+    input:
+      content: "超便宜！高仿品牌包包，一模一样，绝对值！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      初审识别"高仿"违禁词，终审复核后必须过滤
+
+  - sample_id: med_002
+    difficulty: medium
+    input:
+      content: "正品保证，假冒一赔十，快来抢购！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      初审识别"假冒"违禁词，终审输出不得复述该词
+
+  - sample_id: med_003
+    difficulty: medium
+    input:
+      content: "绝对值！这款手机保证正品，假一赔三，数量有限！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      "假一赔三"暗示仿冒风险，链路两端均应触发过滤
+
+  # ── hard：边界情况，分数与违禁词冲突 ──────────────────────────────────
+  - sample_id: hard_001
+    difficulty: hard
+    input:
+      content: "这款商品虽然质量一般，但价格极低，性价比超高，绝对值！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      "绝对值"是夸大宣传，终审应基于低分（30）过滤
+
+  - sample_id: hard_002
+    difficulty: hard
+    input:
+      content: "进口商品，质量保证，但有用户反馈与描述不符，建议谨慎购买。"
+    ground_truth:
+      should_filter: false
+      total_score: 64
+      expected_range: [55, 75]
+    expected_behavior: |
+      含负面反馈但无违禁词，终审应基于评分 64 判定不过滤
+
+  - sample_id: hard_003
+    difficulty: hard
+    input:
+      content: "秒杀！限时抢购！这款高仿运动鞋，质量媲美正品，手慢无！"
+    ground_truth:
+      should_filter: true
+      total_score: 30
+      expected_range: [0, 45]
+    expected_behavior: |
+      初审识别"高仿"，终审必须过滤且不得复述该词
+
+rubric:
+  l1:
+    format: json
+    strict_json: true
+    tool_calls_valid: true
+    required_fields: [should_filter, total_score, reason]
+
+  l2:
+    - name: tool_called_review
+      check: tool_called
+      tool: review_content
+
+    - name: tool_param_content_passed
+      check: tool_param_equals
+      tool: review_content
+      param: content
+      expect: $gt.input_content
+
+    - name: filter_decision_correct
+      check: field_equals
+      field: should_filter
+      expect: $gt.should_filter
+      weight: 2.0
+      critical: true
+
+    - name: score_in_range
+      check: field_in_range
+      field: total_score
+      range: $gt.expected_range
+
+    - name: efficiency_steps
+      check: max_steps
+      limit: 4
+
+  l3:
+    - name: reason_non_empty
+      check: field_non_empty
+      field: reason
+
+    - name: no_violation_output
+      check: regex_absent
+      pattern: "(高仿|假冒|正品保证|绝对值|假一赔)"
+      critical: true
+
+    - name: reason_semantic_quality
+      check: llm_judge
+
+aggregation:
+  k: 3
+  pass_threshold: 0.6
+  ci_threshold: 0.8

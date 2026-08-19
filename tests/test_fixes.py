@@ -631,3 +631,217 @@ def test_p3_agent_loop_missing_api_key_raises(monkeypatch):
     # 显式传 key 不触发探测（走正常构造路径）
     loop2 = AgentLoop(model="m", strategy="react", api_key="sk-test")
     assert loop2.client is not None
+
+
+# ─── 第四轮（2026-08-19 功能缺陷核查修复）──────────────────────────────────
+#  · #5  mock_params 从工具 schema 声明式构造，不再硬编码工具名
+#  · #3  mock 模式下 --judge 可真实调用 LLM Judge（注入 fake client 验证整条链路）
+#  · #6  多 Agent 协作链路：顺序执行 + 链路 trace 合并评分
+
+# ─── #5：mock_params 声明式化 ──────────────────────────────────────────────
+
+def test_mock_params_derived_from_schema():
+    """#5：参数由 tools schema 驱动，新增工具无需改代码"""
+    from harness.mock_agent import mock_params
+    tools = [
+        {"type": "function", "function": {"name": "query_order", "parameters": {
+            "type": "object", "properties": {"order_id": {"type": "string"}},
+            "required": ["order_id"]}}},
+        {"type": "function", "function": {"name": "submit_refund", "parameters": {
+            "type": "object", "properties": {"order_id": {"type": "string"},
+                                             "amount": {"type": "number"}},
+            "required": ["order_id", "amount"]}}},
+        {"type": "function", "function": {"name": "send_notification", "parameters": {
+            "type": "object", "properties": {"user_id": {"type": "string"},
+                                             "message": {"type": "string"}},
+            "required": ["user_id", "message"]}}},
+        {"type": "function", "function": {"name": "lookup_stock", "parameters": {
+            "type": "object", "properties": {"symbol": {"type": "string"},
+                                             "limit": {"type": "integer"}},
+            "required": ["symbol"]}}},
+    ]
+    sample = {"input": {"content": "hello"}, "ground_truth": {}}
+    gt = {"order_id": "ORD-1", "amount": 299.0}
+    # input / ground_truth 命中优先
+    assert mock_params("query_order", sample, gt, tools) == {"order_id": "ORD-1"}
+    assert mock_params("submit_refund", sample, gt, tools) == \
+        {"order_id": "ORD-1", "amount": 299.0}
+    # 未命中 → 按类型占位（string→""），required 校验可过
+    assert mock_params("send_notification", sample, gt, tools) == \
+        {"user_id": "", "message": ""}
+    # 新工具不需要改代码：schema 直接驱动
+    assert mock_params("lookup_stock", sample, gt, tools) == {"symbol": "", "limit": 0}
+
+
+def test_mock_agent_run_uses_schema_driven_params():
+    """#5：完整 mock 运行下，工具参数按 schema 构造且能通过沙箱校验（含新工具）"""
+    from harness.mock_agent import mock_agent_run
+    spec = {
+        "task_id": "t", "agent_id": "a", "prompt_version": "v1",
+        "tools": [{"type": "function", "function": {"name": "lookup_stock", "parameters": {
+            "type": "object", "properties": {"symbol": {"type": "string"},
+                                             "limit": {"type": "integer"}},
+            "required": ["symbol"]}}}],
+        "mock_apis": {"lookup_stock": {"price": 12.5}},
+        "rubric": {"l1": {"format": "json", "required_fields": ["symbol"]}},
+    }
+    sample = {"sample_id": "s1", "input": {}, "ground_truth": {"symbol": "AAPL"}}
+    sb = MockSandbox(mock_apis=spec["mock_apis"], task_id="t", sample_id="s1",
+                     agent_id="a", tool_definitions=spec["tools"])
+    trace = mock_agent_run(spec, sample, sb, trial_id=1)
+    assert trace.steps[0].tool_name == "lookup_stock"
+    assert trace.steps[0].params == {"symbol": "AAPL", "limit": 0}  # schema 驱动，无硬编码
+    assert trace.steps[0].error is None                              # 通过沙箱参数校验
+
+
+# ─── #3：Judge 真实调用路径 ────────────────────────────────────────────────
+
+class _JudgeResp:
+    def __init__(self, raw: str):
+        self.choices = [SimpleNamespace(message=SimpleNamespace(content=raw))]
+
+
+class _JudgeCompletions:
+    def __init__(self, raw: str):
+        self._raw = raw
+
+    def create(self, **kwargs):
+        return _JudgeResp(self._raw)
+
+
+class _JudgeChat:
+    def __init__(self, raw: str):
+        self.completions = _JudgeCompletions(raw)
+
+
+class _JudgeClient:
+    """OpenAI client 替身：judge.judge 只消费 chat.completions.create 的返回"""
+    def __init__(self, raw: str):
+        self.chat = _JudgeChat(raw)
+
+
+def test_llm_judge_invocation_through_run_trial_in_mock_mode():
+    """#3：mock 模式 + --judge 时，LLM Judge 真实生效（fake client 验证整条链路）"""
+    from harness.pipeline import run_trial
+    from metrics.judge import LLMJudge
+
+    spec = {
+        "task_id": "t3", "agent_id": "a3", "prompt_version": "v1",
+        "tools": [], "mock_apis": {},
+        "rubric": {"l1": {"format": "json", "required_fields": ["ok"]}},
+        "scoring": {"judge_rubric": "打分"}, "aggregation": {},
+    }
+    sample = {"sample_id": "s1", "input": {}, "ground_truth": {"ok": 1},
+              "expected_behavior": ""}
+
+    with patch("metrics.judge.OpenAI", return_value=_JudgeClient("0.75")):
+        judge = LLMJudge(mode="numeric", api_key="sk-fake", judge_model="fake-judge")
+    scorer = HybridScorer(spec["rubric"], judge=judge,
+                          weights={"rule": 0.5, "judge": 0.5},
+                          judge_rubric="打分")
+    trace, res = run_trial(spec, sample, 1, scorer, None, mock_run=True)
+
+    # Judge 层真实被调用：分数进入结果，未短路
+    assert res["judge_skipped"] is False
+    assert res["judge_score"] == pytest.approx(0.75)
+    # final = 0.5 * rule(1.0) + 0.5 * judge(0.75)
+    assert res["overall_score"] == pytest.approx(0.875)
+
+
+def test_llm_judge_missing_key_falls_back_to_rule():
+    """#3：--judge 但缺 API Key → Judge 调用抛错被吞 → 权重回落到规则层，不崩"""
+    from harness.pipeline import run_trial
+    from metrics.judge import LLMJudge
+
+    spec = {
+        "task_id": "t3", "agent_id": "a3", "prompt_version": "v1",
+        "tools": [], "mock_apis": {},
+        "rubric": {"l1": {"format": "json", "required_fields": ["ok"]}},
+        "scoring": {"judge_rubric": "打分"}, "aggregation": {},
+    }
+    sample = {"sample_id": "s1", "input": {}, "ground_truth": {"ok": 1},
+              "expected_behavior": ""}
+
+    class _BoomCompletions:
+        def create(self, **kwargs):
+            raise RuntimeError("AuthenticationError: invalid api key")
+
+    class _BoomClient:
+        """SDK 惰性客户端：构造成功，调用时才因缺 Key 抛错（更贴近真实行为）"""
+        def __init__(self, *a, **kw):
+            self.chat = SimpleNamespace(completions=_BoomCompletions())
+
+    with patch("metrics.judge.OpenAI", return_value=_BoomClient()):
+        judge = LLMJudge(mode="numeric", api_key=None, judge_model="fake-judge")
+    scorer = HybridScorer(spec["rubric"], judge=judge,
+                          weights={"rule": 0.5, "judge": 0.5},
+                          judge_rubric="打分")
+    trace, res = run_trial(spec, sample, 1, scorer, None, mock_run=True)
+    assert res["judge_skipped"] is True
+    assert res["judge_score"] == 0.0
+    assert res["overall_score"] == pytest.approx(1.0)   # 规则层兜底
+
+
+# ─── #6：多 Agent 协作链路 ─────────────────────────────────────────────────
+
+def _chain_spec() -> dict:
+    return {
+        "task_id": "chain_t1", "chain_id": "chain_v1", "prompt_version": "v1",
+        "agents": [
+            {"agent_id": "reviewer", "agent_prompt": "初审",
+             "tools": [{"type": "function", "function": {"name": "review", "parameters": {
+                 "type": "object", "properties": {"content": {"type": "string"}},
+                 "required": ["content"]}}}],
+             "mock_apis": {"review": {"score": 64}}, "max_steps": 5},
+            {"agent_id": "approver", "agent_prompt": "终审",
+             "tools": [{"type": "function", "function": {"name": "finalize", "parameters": {
+                 "type": "object", "properties": {
+                     "should_filter": {"type": "boolean"},
+                     "reason": {"type": "string"}},
+                 "required": ["should_filter", "reason"]}}}],
+             "mock_apis": {"finalize": {"accepted": True}}, "max_steps": 5},
+        ],
+        "rubric": {"l1": {"format": "json", "required_fields": ["should_filter", "reason"]},
+                   "l2": [{"name": "tool_called_review", "check": "tool_called", "tool": "review"}]},
+        "scoring": {}, "aggregation": {},
+    }
+
+
+def test_p3_chain_runs_two_agents_and_merges_trace():
+    """#6：链路两环顺序执行，合并 trace 供规则层对全链路评分"""
+    from harness.pipeline import run_chain
+    spec = _chain_spec()
+    sample = {"sample_id": "s1", "input": {"content": "abc"},
+              "ground_truth": {"should_filter": False, "reason": "ok"},
+              "expected_behavior": ""}
+    scorer = HybridScorer(spec["rubric"], judge=None)
+    trace, res = run_chain(spec, sample, 1, scorer, None, mock_run=True)
+
+    assert trace.agent_id == "chain_v1"                  # 链路以 chain_id 标识
+    assert [s.tool_name for s in trace.steps] == ["review", "finalize"]  # 两环工具都进了合并 trace
+    assert res["rule_score"] == 1.0
+    assert res["failure_reason"] is None
+
+
+def test_p3_chain_scoring_sees_full_trajectory():
+    """#6：规则层对全链路评分——链路中任一环缺失工具调用，合并 trace 会暴露"""
+    from harness.pipeline import run_chain
+    spec = _chain_spec()
+    # 第一环不调用 review（无该工具定义）→ rubric 的 tool_called review 在整链上缺失
+    spec["agents"][0]["tools"] = []
+    spec["agents"][0]["mock_apis"] = {}
+    sample = {"sample_id": "s1", "input": {"content": "abc"},
+              "ground_truth": {"should_filter": False, "reason": "ok"},
+              "expected_behavior": ""}
+    scorer = HybridScorer(spec["rubric"], judge=None)
+    trace, res = run_chain(spec, sample, 1, scorer, None, mock_run=True)
+    assert [s.tool_name for s in trace.steps] == ["finalize"]  # 只剩第二环
+    assert res["rule_score"] < 1.0                             # 缺 review → 轨迹类 check 失败
+    assert res["failure_reason"] == FailureReason.TRAJECTORY_DEVIATION
+
+
+def test_p3_chain_requires_agents():
+    from harness.pipeline import run_chain
+    with pytest.raises(ValueError, match="agents"):
+        run_chain({"task_id": "x", "agents": []}, {"sample_id": "s"}, 1,
+                  HybridScorer({}, judge=None), None, True)

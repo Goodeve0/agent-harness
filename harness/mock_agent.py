@@ -56,8 +56,9 @@ def mock_agent_run(spec: dict, sample: dict, sandbox: MockSandbox, trial_id: int
         seq = defect.get("tools") or []
         if seq:
             call_tools = seq[:-1]
+    tool_defs = spec.get("tools", [])
     for name in call_tools:
-        sandbox.call_tool(name, mock_params(name, sample, gt))
+        sandbox.call_tool(name, mock_params(name, sample, gt, tool_defs))
 
     # 输出尽量贴合 ground_truth（剔除 expected_range 等评测元字段）
     output = {k: v for k, v in gt.items() if k != "expected_range"}
@@ -157,15 +158,27 @@ def as_bool(v: Any, default: bool = False) -> bool:
     return bool(v)
 
 
-def mock_params(tool_name: str, sample: dict, gt: dict) -> dict:
-    """构造 mock 工具调用参数，尽量贴合 ground_truth 以通过参数校验"""
-    inp = sample.get("input", {})
-    if tool_name == "review_content":
-        return {"content": inp.get("content", "")}
-    if tool_name == "query_order":
-        return {"order_id": gt.get("order_id", "")}
-    if tool_name == "submit_refund":
-        return {"order_id": gt.get("order_id", ""), "amount": gt.get("amount", 0)}
-    if tool_name == "send_notification":
-        return {"user_id": "user_123", "message": "您的退款已提交"}
-    return {}
+def mock_params(tool_name: str, sample: dict, gt: dict, tools: list[dict]) -> dict:
+    """从工具 schema 声明式构造 mock 调用参数，不再硬编码工具名。
+
+    取值优先级：sample.input 命中 > ground_truth 命中 > 按类型给占位值。
+    占位值满足 MockSandbox 的 required / 类型校验，任何工具都能走通调用链路；
+    新增工具只需在 YAML 声明 schema，无需改本函数。
+    """
+    schema: dict = {}
+    for t in tools or []:
+        fn = t.get("function", {})
+        if fn.get("name") == tool_name:
+            schema = fn.get("parameters", {}) or {}
+            break
+    placeholders = {"string": "", "integer": 0, "number": 0.0,
+                    "boolean": False, "object": {}, "array": []}
+    params: dict[str, Any] = {}
+    for key, prop in (schema.get("properties") or {}).items():
+        for src in (sample.get("input", {}), gt):
+            if key in src:
+                params[key] = src[key]
+                break
+        else:
+            params[key] = placeholders.get((prop or {}).get("type"), "")
+    return params

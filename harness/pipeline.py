@@ -17,7 +17,7 @@ from rich.console import Console
 from dataset.tracer import GoldenDataset
 from harness.agent_loop import AgentLoop
 from harness.mock_agent import mock_agent_run
-from harness.sandbox import MockSandbox
+from harness.sandbox import AgentTrace, MockSandbox
 from metrics.cli_judge import CLIJudge
 from metrics.cross_validator import CrossValidator
 from metrics.hybrid_scorer import HybridScorer
@@ -32,7 +32,7 @@ console = Console()
 
 def run_trial(spec: dict, sample: dict, trial_id: int, scorer: HybridScorer,
               cross_validator: CrossValidator | None, mock_run: bool):
-    """执行一次 trial：跑 Agent → 记录 Trace → 双层评分"""
+    """执行一次 trial：跑单个 Agent → 记录 Trace → 双层评分"""
     sandbox = MockSandbox(
         mock_apis=spec.get("mock_apis", {}),
         task_id=spec["task_id"],            # 干净的 task_id，不再拼接 sample_id
@@ -56,7 +56,89 @@ def run_trial(spec: dict, sample: dict, trial_id: int, scorer: HybridScorer,
                   f"当前任务输入：{json.dumps(sample['input'], ensure_ascii=False)}")
         trace = loop.run(prompt, sandbox)
 
-    # ── 双层评分 ──────────────────────────────────────────────────────────────
+    res_dict = _score_trace(trace, sample, trial_id, spec, scorer, cross_validator)
+    return trace, res_dict
+
+
+def run_chain(spec: dict, sample: dict, trial_id: int, scorer: HybridScorer,
+              cross_validator: CrossValidator | None, mock_run: bool):
+    """顺序执行多 Agent 协作链路：上一环最终输出作为下一环的输入上下文。
+
+    spec 形态：
+      agents:
+        - agent_id / agent_prompt / strategy / max_steps / tools / mock_apis
+      chain_id / task_id / rubric / samples / scoring 在顶层，整链共享。
+
+    链路 trace 合并为一条（steps/messages 拼接、最终输出取最后一环），规则层
+    对整条链路轨迹评分——rubric 无需为多 Agent 改造，tool_called / tool_sequence
+    等 check 天然看到全链路。mock 模式同样可用：每个 Agent 各自走 mock 注入。
+    """
+    agents = spec.get("agents", [])
+    if not agents:
+        raise ValueError("run_chain 需要 spec['agents'] 非空（否则请用 run_trial）")
+    chain_id = spec.get("chain_id") or agents[0]["agent_id"]
+    version = spec.get("prompt_version", "v1")
+
+    hop_traces: list[Any] = []
+    upstream = dict(sample.get("input", {}))
+    for agent_cfg in agents:
+        sandbox = MockSandbox(
+            mock_apis=agent_cfg.get("mock_apis", {}),
+            task_id=spec["task_id"],
+            sample_id=sample["sample_id"],
+            agent_id=agent_cfg["agent_id"],
+            prompt_version=version,
+            tool_definitions=agent_cfg.get("tools", []),
+        )
+        # 每个 Agent 用自己的 tools/mock_apis/prompt/max_steps，共享任务 rubric
+        agent_spec = {
+            **spec,
+            "agent_id": agent_cfg["agent_id"],
+            "agent_prompt": agent_cfg.get("agent_prompt", ""),
+            "tools": agent_cfg.get("tools", []),
+            "mock_apis": agent_cfg.get("mock_apis", {}),
+            "max_steps": agent_cfg.get("max_steps", spec.get("max_steps", 10)),
+        }
+        if mock_run:
+            trace = mock_agent_run(agent_spec, sample, sandbox, trial_id)
+        else:
+            loop = AgentLoop(
+                model=os.getenv("EVAL_MODEL", "gpt-4o-mini"),
+                tools=agent_cfg.get("tools", []),
+                strategy=agent_cfg.get("strategy", "function_calling"),
+                max_steps=agent_cfg.get("max_steps", spec.get("max_steps", 10)),
+            )
+            prompt = (f"{agent_cfg.get('agent_prompt', '')}\n\n"
+                      f"当前任务输入：{json.dumps(sample['input'], ensure_ascii=False)}\n"
+                      f"上游 Agent 输出：{json.dumps(upstream, ensure_ascii=False)}")
+            trace = loop.run(prompt, sandbox)
+        hop_traces.append(trace)
+        # 下游上下文 = 原始输入 + 上游最终输出
+        upstream = {**sample.get("input", {}), "upstream_output": trace.final_output}
+
+    # ── 合并链路 trace：整条链的轨迹交给规则层统一评分 ────────────────────────
+    merged = AgentTrace(
+        task_id=spec["task_id"],
+        sample_id=sample["sample_id"],
+        agent_id=chain_id,
+        prompt_version=version,
+    )
+    for tr in hop_traces:
+        merged.steps.extend(tr.steps)
+        merged.messages.extend(tr.messages)
+    merged.final_output = hop_traces[-1].final_output
+    merged.total_tokens = sum(t.total_tokens for t in hop_traces)
+    merged.total_latency_ms = sum(t.total_latency_ms for t in hop_traces)
+    merged.success = hop_traces[-1].success
+    merged.failure_reason = hop_traces[-1].failure_reason
+
+    res_dict = _score_trace(merged, sample, trial_id, spec, scorer, cross_validator)
+    return merged, res_dict
+
+
+def _score_trace(trace: AgentTrace, sample: dict, trial_id: int, spec: dict,
+                 scorer: HybridScorer, cross_validator: CrossValidator | None) -> dict:
+    """双层评分 + 可选交叉校验 + 终端输出（run_trial / run_chain 共用，保证口径一致）"""
     gt = dict(sample.get("ground_truth", {}))
     gt.setdefault("input_content", sample.get("input", {}).get("content", ""))
 
@@ -67,7 +149,7 @@ def run_trial(spec: dict, sample: dict, trial_id: int, scorer: HybridScorer,
     res_dict["trial_id"] = trial_id
 
     # ── 双模型交叉校验（可选）：分歧取保守分，仲裁结果回写 judge 分与总分 ──────
-    if cross_validator and not mock_run:
+    if cross_validator:
         rec = cross_validator.validate(
             sample_id=f"{sample['sample_id']}_t{trial_id}",
             text=trace.final_output,
@@ -107,7 +189,7 @@ def run_trial(spec: dict, sample: dict, trial_id: int, scorer: HybridScorer,
         for f in res_dict["rule_detail"]["failed"][:2]:
             console.print(f"        [dim]↳ {f['name']}: {f['detail']}[/]")
 
-    return trace, res_dict
+    return res_dict
 
 
 # ─────────────────────────────────────────────────────────────────────────────

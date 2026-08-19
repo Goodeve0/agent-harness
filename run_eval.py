@@ -38,6 +38,7 @@ AgentHarness 主入口 —— 多 Agent 协作链路评测平台
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +54,7 @@ from rich.console import Console
 from harness.pipeline import (          # noqa: F401（下划线别名供旧 import 兼容）
     load_regression_samples,
     run_trial,
+    run_chain,
     select_ci_metric,
     build_judge as _build_judge,        # 兼容 tests/test_pipeline.py 的 from run_eval import _build_judge
 )
@@ -75,6 +77,8 @@ from report.reporter import Reporter, DiffReporter, ci_gate
 @click.option("--runs", default=None, type=int, show_default=True,
               help="每样本 trial 次数（Pass^k），默认取 YAML aggregation.k")
 @click.option("--mock-run", is_flag=True, help="Mock 模式：不调 LLM，验证评测链路")
+@click.option("--judge", "with_judge", is_flag=True,
+              help="Mock 模式下也真实调用 LLM Judge / 交叉校验（需 OPENAI_API_KEY，验证 Judge 链路）")
 @click.option("--cross-check", is_flag=True, help="开启双模型交叉校验")
 @click.option("--judge-a", default=None, help="交叉校验模型 A（openai 后端时生效）")
 @click.option("--judge-b", default=None, help="交叉校验模型 B（openai 后端时生效）")
@@ -93,7 +97,7 @@ from report.reporter import Reporter, DiffReporter, ci_gate
 @click.option("--baseline", default=None, help="baseline 报告 JSON 路径")
 @click.option("--no-ingest", is_flag=True, help="不将 Bad Case 写入 Golden Dataset")
 @click.option("--no-regression", is_flag=True, help="不加载未修复 Golden Case 回归测试")
-def main(task, runs, mock_run, cross_check, judge_a, judge_b,
+def main(task, runs, mock_run, with_judge, cross_check, judge_a, judge_b,
          judge_a_backend, judge_b_backend,
          ci, ci_metric, threshold, diff, baseline, no_ingest, no_regression):
     """AgentHarness —— 多 Agent 协作链路评测平台"""
@@ -105,7 +109,9 @@ def main(task, runs, mock_run, cross_check, judge_a, judge_b,
     spec = yaml.safe_load(task_path.read_text())
 
     task_id = spec["task_id"]
-    agent_id = spec["agent_id"]
+    agents = spec.get("agents")
+    is_chain = bool(agents)             # agents 非空 → 多 Agent 协作链路模式
+    agent_id = (spec.get("chain_id") or agents[0]["agent_id"]) if is_chain else spec["agent_id"]
     version = spec.get("prompt_version", "v1")
     task_samples = spec.get("samples", [])
     golden = GoldenDataset()
@@ -120,14 +126,27 @@ def main(task, runs, mock_run, cross_check, judge_a, judge_b,
                   f"task=[cyan]{task_id}[/]  agent=[cyan]{agent_id}[/]  "
                   f"version=[cyan]{version}[/]  samples={len(samples)}  runs={runs}"
                   + ("  [yellow][MOCK][/]" if mock_run else ""))
+    if is_chain:
+        console.print("[dim]  协作链路: " + " → ".join(a["agent_id"] for a in agents) + "[/]")
     regression_count = sum(1 for s in samples if s.get("regression_case_id"))
     if regression_count:
         console.print(f"[dim]  已自动加载 {regression_count} 条未修复 Golden Case[/]")
 
+    # --judge 只在显式开启时让 mock 模式发真实 LLM 调用；缺 Key 时友好降级
+    allow_real_judge = (not mock_run) or with_judge
+    has_llm_key = bool(os.getenv("OPENAI_API_KEY"))
+
     # ── 组装评分器 ────────────────────────────────────────────────────────────
     judge = None
-    if not mock_run and scoring_cfg.get("judge_rubric"):
-        judge = LLMJudge(mode=scoring_cfg.get("judge_mode", "numeric"))
+    if scoring_cfg.get("judge_rubric"):
+        if allow_real_judge and has_llm_key:
+            judge = LLMJudge(mode=scoring_cfg.get("judge_mode", "numeric"))
+            if mock_run:
+                console.print("[dim]  --judge：mock 模式下真实调用 LLM Judge（产生真实 LLM 调用）[/]")
+        elif allow_real_judge and not has_llm_key:
+            # OpenAI SDK 在构造时即校验 Key，缺 Key 构造会直接抛错；提前拦截并降级。
+            # 真实模式（非 mock）下 Agent 调用同样会失败（AgentLoop 会给友好报错）。
+            console.print("[yellow]  未检测到 OPENAI_API_KEY：Judge 不可用，回退纯规则评分[/]")
 
     scorer = HybridScorer(
         rubric=spec.get("rubric", {}),
@@ -140,25 +159,29 @@ def main(task, runs, mock_run, cross_check, judge_a, judge_b,
     console.print(f"[dim]  双层权重: rule={scorer.w_rule:.1f} / judge={scorer.w_judge:.1f}[/]")
 
     cross_validator = None
-    if cross_check and not mock_run:
-        model_a = judge_a or "gpt-4o-mini"
-        model_b = judge_b or "gpt-4o"
-        judge_mode = scoring_cfg.get("judge_mode", "numeric")
-        judge_a_obj = _build_judge(judge_a_backend, model_a, judge_mode)
-        judge_b_obj = _build_judge(judge_b_backend, model_b, judge_mode)
-        # CLI 后端启动前探测可用性（fail-open：不可用以 -1 进入仲裁，不崩主流程）
-        for label, j in (("A", judge_a_obj), ("B", judge_b_obj)):
-            if isinstance(j, CLIJudge):
-                ok, info = j.available()
-                icon = "✅" if ok else "⚠️"
-                console.print(f"[dim]  judge {label}[{j.backend}] {icon} {info}[/]")
-        cross_validator = CrossValidator(
-            judge_a=judge_a_obj,
-            judge_b=judge_b_obj,
-            threshold=pass_threshold,
-        )
-        console.print(f"[dim]  交叉校验: {judge_a_obj.judge_model} × {judge_b_obj.judge_model}"
-                      f"（backend: {judge_a_backend}/{judge_b_backend}）[/]")
+    if cross_check and allow_real_judge:
+        need_key = judge_a_backend == "openai" or judge_b_backend == "openai"
+        if need_key and not has_llm_key:
+            console.print("[yellow]  未检测到 OPENAI_API_KEY：交叉校验（openai 后端）不可用，跳过[/]")
+        else:
+            model_a = judge_a or "gpt-4o-mini"
+            model_b = judge_b or "gpt-4o"
+            judge_mode = scoring_cfg.get("judge_mode", "numeric")
+            judge_a_obj = _build_judge(judge_a_backend, model_a, judge_mode)
+            judge_b_obj = _build_judge(judge_b_backend, model_b, judge_mode)
+            # CLI 后端启动前探测可用性（fail-open：不可用以 -1 进入仲裁，不崩主流程）
+            for label, j in (("A", judge_a_obj), ("B", judge_b_obj)):
+                if isinstance(j, CLIJudge):
+                    ok, info = j.available()
+                    icon = "✅" if ok else "⚠️"
+                    console.print(f"[dim]  judge {label}[{j.backend}] {icon} {info}[/]")
+            cross_validator = CrossValidator(
+                judge_a=judge_a_obj,
+                judge_b=judge_b_obj,
+                threshold=pass_threshold,
+            )
+            console.print(f"[dim]  交叉校验: {judge_a_obj.judge_model} × {judge_b_obj.judge_model}"
+                          f"（backend: {judge_a_backend}/{judge_b_backend}）[/]")
 
     aggregator = MetricAggregator(pass_threshold=pass_threshold)
     tracer = Tracer(pass_threshold=pass_threshold)
@@ -173,8 +196,12 @@ def main(task, runs, mock_run, cross_check, judge_a, judge_b,
         sample_scores = []
         for trial_id in range(1, runs + 1):
             try:
-                trace, res = run_trial(spec, sample, trial_id, scorer,
-                                       cross_validator, mock_run)
+                if is_chain:
+                    trace, res = run_chain(spec, sample, trial_id, scorer,
+                                           cross_validator, mock_run)
+                else:
+                    trace, res = run_trial(spec, sample, trial_id, scorer,
+                                           cross_validator, mock_run)
             except Exception as e:
                 console.print(f"    [red]❌ trial{trial_id} 执行异常: {e}[/]")
                 res = {"overall_score": 0.0, "failure_reason": "EXECUTION_ERROR",
