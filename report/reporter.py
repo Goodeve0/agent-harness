@@ -39,7 +39,11 @@ class Reporter:
     def to_dict(self) -> dict:
         if not self.eval_results:
             return {}
-        n = len(self.eval_results)   # n = samples × runs，pass_rate 为 trial 级口径
+        # 口径区分：n = samples × runs 是 trial 总数；真实样本数按 sample_id 去重
+        #（历史版本 total_samples 误存 trial 数，靠注释兼容；现已显式区分）。
+        n = len(self.eval_results)
+        sample_ids = {r.get("sample_id") for r in self.eval_results if r.get("sample_id")}
+        total_samples = len(sample_ids) or n   # 异常分支可能缺 sample_id，回退 trial 数
         scores = [r.get("overall_score", 0.0) for r in self.eval_results]
         rule_scores = [r.get("rule_score", 0.0) for r in self.eval_results]
         judge_scores = [r.get("judge_score", 0.0) for r in self.eval_results]
@@ -72,9 +76,8 @@ class Reporter:
             "task_id": self.task_id,
             "agent_id": self.agent_id,
             "prompt_version": self.prompt_version,
-            # 兼容字段：历史报告读取 total_samples，实际是 trial 总数
-            "total_samples": n,
-            "total_trials": n,
+            "total_trials": n,              # trial 总数（samples × runs），主口径
+            "total_samples": total_samples, # 真实样本数（按 sample_id 去重）
             # trial 级口径（随 --runs 漂移，跨 runs 对比请用样本级 pass@k）
             "pass_rate": round(pass_rate, 4),
             "avg_score": round(sum(scores) / n, 4),

@@ -25,6 +25,7 @@ Thumbs.db
 
 # Eval output (generated, not source)
 report/output/
+report/traces/
 dataset/golden_set.jsonl
 
 # Local tooling / IDE caches

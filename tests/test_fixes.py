@@ -15,6 +15,14 @@
   · P2-2  LLMJudge._parse_numeric 分制推断：8分/85分/漏小数点/计数词不伪造
   · P2-3  ReAct Action Input 嵌套 JSON 提取（栈式花括号，非贪婪正则不再截断）
   · P2-1  ReAct 格式漂移产生失败信号：format_error_feedback + AgentLoop 纠错循环
+
+第三轮（2026-08-19 P3 优化回归）：
+  · P3-1  run_eval 拆分（harness/pipeline.py + harness/mock_agent.py）后链路不裂
+  · P3-2  MockSandbox 返回值 deepcopy：被测 Agent 修改响应不污染后续调用
+  · P3-3  ToolCall.is_mock 序列化导出
+  · P3-4  HybridScorer 双短路合并（critical 一票否决 / L1 失败共用返回路径）
+  · P3-5  Reporter total_trials / total_samples 口径区分
+  · P3-6  AgentLoop 缺 API Key 显式探测（友好报错而非 401）
 """
 import sys
 from pathlib import Path
@@ -30,8 +38,10 @@ from harness.sandbox import AgentTrace, MockSandbox
 from harness.agent_loop import AgentLoop, _MAX_FORMAT_RETRIES
 from metrics.judge import LLMJudge
 from metrics.cross_validator import CrossValidator, CrossCheckRecord
+from metrics.hybrid_scorer import HybridScorer, FailureReason
 from metrics.rule_checker import RuleChecker, _as_bool
 from dataset.tracer import GoldenDataset
+from report.reporter import Reporter
 from strategies.react import ReActStrategy, _extract_json_object
 
 
@@ -277,7 +287,8 @@ class _FakeClient:
 
 def _run_loop(contents: list[str], mock_apis: dict | None = None,
               max_steps: int = 10) -> AgentTrace:
-    loop = AgentLoop(model="fake", strategy="react", max_steps=max_steps)
+    # api_key 必须显式传入：client 缺 Key 探测（P3-6）会拦截未配 Key 的真实构造
+    loop = AgentLoop(model="fake", strategy="react", max_steps=max_steps, api_key="sk-fake")
     sandbox = MockSandbox(mock_apis=mock_apis or {}, task_id="t1", agent_id="a1")
     with patch("harness.agent_loop.OpenAI", return_value=_FakeClient(contents)):
         return loop.run("任务", sandbox)
@@ -519,3 +530,104 @@ def test_tool_param_checks_all_calls():
     rs = RuleChecker(rubric).check(tr, {"amount": 299.0})
     assert rs.by_layer("l2")["amt"] == 0
     assert "1/2" in rs.failed_checks()[0].detail
+
+
+# ─── 第三轮：P3 优化回归 ─────────────────────────────────────────────────────
+
+def test_p3_run_trial_mock_smoke():
+    """P3-1：run_eval 拆分后 run_trial 在 mock 模式链路完整（重构不破坏行为）"""
+    from harness.pipeline import run_trial
+    spec = {
+        "task_id": "t3", "agent_id": "a3", "prompt_version": "v1",
+        "tools": [{"type": "function", "function": {"name": "query_order",
+                  "parameters": {"type": "object", "properties": {},
+                                 "required": []}}}],
+        "mock_apis": {"query_order": {"order_id": "o1"}},
+        "rubric": {"l1": {"format": "json", "required_fields": ["order_id"]}},
+        "scoring": {}, "aggregation": {},
+    }
+    sample = {"sample_id": "s1", "input": {}, "ground_truth": {"order_id": "o1"},
+              "expected_behavior": ""}
+    scorer = HybridScorer(spec["rubric"], judge=None)
+    trace, res = run_trial(spec, sample, 1, scorer, None, mock_run=True)
+    assert res["sample_id"] == "s1"
+    assert res["trial_id"] == 1
+    assert trace.success is True
+    assert res["rule_score"] == 1.0
+
+
+def test_p3_mock_sandbox_deepcopies_shared_response():
+    """P3-2：非 callable mock 值返回副本，被测 Agent 修改响应不污染后续调用"""
+    sb = MockSandbox(mock_apis={"get": {"data": [1, 2, 3]}})
+    r1 = sb.call_tool("get", {})
+    r1["data"].append(999)          # 模拟被测 Agent 修改响应
+    r2 = sb.call_tool("get", {})
+    assert r2["data"] == [1, 2, 3]  # 第二次调用不受污染
+    # _conditional matcher 返回的内部 dict 同样受保护
+    sb2 = MockSandbox(mock_apis={"c": {"_conditional": [
+        {"if": {"content_contains_any": ["x"]}, "return": {"hit": 1}},
+        {"default": {"hit": 0}},
+    ]}})
+    a = sb2.call_tool("c", {"content": "x"})
+    a["hit"] = 99
+    assert sb2.call_tool("c", {"content": "x"})["hit"] == 1
+
+
+def test_p3_tool_call_is_mock_serialized():
+    """P3-3：ToolCall.is_mock 导出到 to_dict()，落盘 trace 可区分 mock/真实调用"""
+    sb = MockSandbox(mock_apis={"f": {"ok": True}})
+    sb.call_tool("f", {})
+    d = sb.trace.to_dict()
+    assert d["steps"][0]["is_mock"] is True
+    # 显式标记非 mock 也能正确序列化
+    tr = AgentTrace(task_id="t", sample_id="s", agent_id="a")
+    tr.add_step("f", {}, {"ok": True}, is_mock=False)
+    assert tr.to_dict()["steps"][0]["is_mock"] is False
+
+
+def test_p3_hybrid_critical_short_circuit_merged():
+    """P3-4：短路合并后 critical 一票否决仍不调 Judge、rule_score 归零、带建议"""
+    rubric = {"l2": [{"name": "money", "check": "field_equals", "field": "amount",
+                      "expect": "$gt.amount", "critical": True}]}
+    scorer = HybridScorer(rubric, judge=None)
+    tr = AgentTrace(task_id="t", sample_id="s", agent_id="a")
+    tr.final_output = '{"amount": 1}'
+    r = scorer.score(tr, {"amount": 299})
+    assert r.final_score == 0.0
+    assert r.rule_score == 0.0          # critical 一票否决 → 规则分归零
+    assert r.judge_skipped is True
+    assert r.failure_reason == FailureReason.CRITICAL_FAILURE
+    assert "一票否决" in r.suggestion
+    # L1 失败路径仍保留规则层得分（与合并前行为一致）
+    rubric_l1 = {"l1": {"format": "json", "required_fields": ["a"]}}
+    r2 = HybridScorer(rubric_l1, judge=None).score(
+        AgentTrace(task_id="t", sample_id="s", agent_id="a", final_output="not json"))
+    assert r2.final_score == 0.0
+    assert r2.rule_score == 0.0
+    assert r2.judge_skipped is True
+
+
+def test_p3_reporter_total_trials_vs_samples():
+    """P3-5：total_trials 为 trial 总数，total_samples 为去重后的真实样本数"""
+    rep = Reporter(task_id="t", agent_id="a", prompt_version="v1")
+    rep.add_result({"sample_id": "s1", "overall_score": 0.9,
+                    "rule_score": 0.9, "judge_score": 0.9})
+    rep.add_result({"sample_id": "s1", "overall_score": 0.8,
+                    "rule_score": 0.8, "judge_score": 0.8})
+    rep.add_result({"sample_id": "s2", "overall_score": 0.7,
+                    "rule_score": 0.7, "judge_score": 0.7})
+    d = rep.to_dict()
+    assert d["total_trials"] == 3
+    assert d["total_samples"] == 2
+
+
+def test_p3_agent_loop_missing_api_key_raises(monkeypatch):
+    """P3-6：缺 API Key 时启动即抛友好 ValueError（而非等 401），可注入绕过"""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    loop = AgentLoop(model="m", strategy="react")
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        loop.client
+    # 显式传 key 不触发探测（走正常构造路径）
+    loop2 = AgentLoop(model="m", strategy="react", api_key="sk-test")
+    assert loop2.client is not None

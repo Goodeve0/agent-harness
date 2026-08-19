@@ -38,10 +38,7 @@ AgentHarness 主入口 —— 多 Agent 协作链路评测平台
 from __future__ import annotations
 
 import json
-import os
-import re
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -50,307 +47,27 @@ import yaml
 from dotenv import load_dotenv
 from rich.console import Console
 
+# 业务逻辑拆分（P3-1）：本文件只保留 CLI 壳与主流程编排，
+# trial 执行 / 回归合并 / Judge 工厂 / CI 口径见 harness/pipeline.py，
+# Mock Agent 见 harness/mock_agent.py。
+from harness.pipeline import (          # noqa: F401（下划线别名供旧 import 兼容）
+    load_regression_samples,
+    run_trial,
+    select_ci_metric,
+    build_judge as _build_judge,        # 兼容 tests/test_pipeline.py 的 from run_eval import _build_judge
+)
+
 load_dotenv()
 console = Console()
 sys.path.insert(0, str(Path(__file__).parent))
 
-from harness.sandbox import MockSandbox
-from harness.agent_loop import AgentLoop
+from dataset.tracer import Tracer, GoldenDataset
+from metrics.aggregators import MetricAggregator
+from metrics.cli_judge import CLIJudge
+from metrics.cross_validator import CrossValidator
 from metrics.hybrid_scorer import HybridScorer
 from metrics.judge import LLMJudge
-from metrics.cli_judge import CLIJudge, probe_cli
-from metrics.cross_validator import CrossValidator
-from metrics.aggregators import MetricAggregator
-from dataset.tracer import Tracer, GoldenDataset
 from report.reporter import Reporter, DiffReporter, ci_gate
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Mock Agent：无 API Key 时用于验证评测链路本身
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _mock_agent_run(spec: dict, sample: dict, sandbox: MockSandbox, trial_id: int):
-    """
-    模拟被测 Agent 行为，用于本地跑通评测链路（无需 API Key）。
-    按任务 rubric 声明式注入缺陷，验证规则层能正确捕获并归因：
-    注入什么缺陷 → 就该归因出什么标签，mock 模式的失败归因因此有验证价值。
-
-    注入点自动从 rubric 推断（也可用 YAML 的 mock_injection.<difficulty> 显式覆盖）：
-      l3 field_non_empty   → field_empty             （→ MISSING_FIELD 类归因）
-      l2 critical field_equals → field_wrong          （→ WRONG_CHOICE / CRITICAL）
-      l2 critical tool_param_equals → tool_param_wrong（→ TOOL_PARAM_ERROR）
-      l3 critical regex_absent → reason_contains_violation（→ SAFETY_VIOLATION）
-      l2 tool_sequence     → skip_last_tool           （→ TRAJECTORY_DEVIATION）
-    """
-    trace = sandbox.get_trace()
-    tools = [t["function"]["name"] for t in spec.get("tools", [])]
-    gt = dict(sample.get("ground_truth", {}))
-    difficulty = sample.get("difficulty", "medium")
-    rubric = spec.get("rubric", {})
-
-    plan = _injection_plan(rubric)
-    yaml_plan = (spec.get("mock_injection") or {}).get(difficulty)
-    if yaml_plan:
-        plan = yaml_plan                    # YAML 显式声明优先于自动推断
-
-    # 注入调度：每轮周期 = 1 次正常路径 + 全部缺陷。
-    # 例：k=3 → [正常, 缺陷A, 缺陷B]；k=4 → [正常, 缺陷A, 缺陷B, 缺陷C]
-    slots: list[dict | None] = [None] + (plan or [])
-    inject = (trial_id - 1) % len(slots)
-    defect = slots[inject]
-
-    # 工具调用：skip_last_tool 缺陷只走前置链路（缺最后一环），其余按序全调用
-    call_tools = list(tools)
-    if defect and defect.get("defect") == "skip_last_tool":
-        seq = defect.get("tools") or []
-        if seq:
-            call_tools = seq[:-1]
-    for name in call_tools:
-        sandbox.call_tool(name, _mock_params(name, sample, gt))
-
-    # 输出尽量贴合 ground_truth（剔除 expected_range 等评测元字段）
-    output = {k: v for k, v in gt.items() if k != "expected_range"}
-    output.setdefault("reason", "工具返回综合评分符合阈值，各维度均无违规风险，故作出该判定。")
-
-    if defect:
-        _apply_defect(defect, output, gt, sandbox)
-
-    trace.final_output = json.dumps(output, ensure_ascii=False)
-    trace.success = True
-    trace.total_tokens = 350
-    return trace
-
-
-def _injection_plan(rubric: dict) -> list[dict]:
-    """从 rubric 自动推断 mock 缺陷注入点，保证"注入什么缺陷 → 归因什么标签"一一对应"""
-    plan: list[dict] = []
-    for rule in rubric.get("l3", []) or []:
-        if isinstance(rule, dict) and rule.get("check") == "field_non_empty":
-            plan.append({"defect": "field_empty", "field": rule.get("field")})
-    for rule in rubric.get("l2", []) or []:
-        if (isinstance(rule, dict) and rule.get("check") == "field_equals"
-                and _as_bool(rule.get("critical", False))):
-            plan.append({"defect": "field_wrong", "field": rule.get("field")})
-    for rule in rubric.get("l2", []) or []:
-        if (isinstance(rule, dict) and rule.get("check") == "tool_param_equals"
-                and _as_bool(rule.get("critical", False))):
-            plan.append({"defect": "tool_param_wrong",
-                         "tool": rule.get("tool"), "param": rule.get("param")})
-    for rule in rubric.get("l3", []) or []:
-        if (isinstance(rule, dict) and rule.get("check") == "regex_absent"
-                and _as_bool(rule.get("critical", False))):
-            plan.append({"defect": "reason_contains_violation",
-                         "pattern": rule.get("pattern", "")})
-    for rule in rubric.get("l2", []) or []:
-        if isinstance(rule, dict) and rule.get("check") == "tool_sequence" and rule.get("sequence"):
-            plan.append({"defect": "skip_last_tool", "tools": rule["sequence"]})
-            break
-    return plan
-
-
-def _apply_defect(defect: dict, output: dict, gt: dict, sandbox: MockSandbox):
-    """按声明式缺陷配置篡改输出 / 追加错误工具调用，模拟真实 Agent 典型失败"""
-    kind = defect.get("defect")
-
-    if kind == "field_empty":
-        field = defect.get("field")
-        if field:
-            output[field] = ""
-
-    elif kind == "field_wrong":
-        field = defect.get("field")
-        if field and field in output:
-            output[field] = _flip_value(output[field])
-
-    elif kind == "tool_param_wrong":
-        tool, param = defect.get("tool"), defect.get("param")
-        if tool and param is not None and param in gt:
-            wrong_val = _flip_value(gt[param])
-            # 追加一次参数错误的调用：副作用工具多调一次错参数即资损，规则层必须抓到
-            sandbox.call_tool(tool, {**gt, param: wrong_val})
-            if param in output:
-                output[param] = wrong_val
-
-    elif kind == "reason_contains_violation":
-        word = _extract_first_word(defect.get("pattern") or "")
-        output["reason"] = f"该商品包含违禁词「{word}」，应予以过滤。"
-
-
-def _flip_value(v: Any) -> Any:
-    """给字段造一个明显错误的值：bool 取反 / 数值 +1 / 字符串加后缀"""
-    if isinstance(v, bool):
-        return not v
-    if isinstance(v, float):
-        return v + 1.0
-    if isinstance(v, int):
-        return v + 1
-    if isinstance(v, str):
-        return v + "_x"
-    return v
-
-
-def _extract_first_word(pattern: str) -> str:
-    """从正则 pattern 里提取第一个候选词用于注入（如 "(高仿|假冒)" → "高仿"）"""
-    cleaned = pattern.replace("(", "").replace(")", "").replace("|", " ")
-    m = re.search(r"[\u4e00-\u9fffA-Za-z0-9]+", cleaned)
-    return m.group() if m else "违禁词"
-
-
-def _as_bool(v: Any, default: bool = False) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on", "是")
-    if v is None:
-        return default
-    return bool(v)
-
-
-def _mock_params(tool_name: str, sample: dict, gt: dict) -> dict:
-    """构造 mock 工具调用参数，尽量贴合 ground_truth 以通过参数校验"""
-    inp = sample.get("input", {})
-    if tool_name == "review_content":
-        return {"content": inp.get("content", "")}
-    if tool_name == "query_order":
-        return {"order_id": gt.get("order_id", "")}
-    if tool_name == "submit_refund":
-        return {"order_id": gt.get("order_id", ""), "amount": gt.get("amount", 0)}
-    if tool_name == "send_notification":
-        return {"user_id": "user_123", "message": "您的退款已提交"}
-    return {}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  单次 trial
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_trial(spec: dict, sample: dict, trial_id: int, scorer: HybridScorer,
-              cross_validator: CrossValidator | None, mock_run: bool):
-    """执行一次 trial：跑 Agent → 记录 Trace → 双层评分"""
-    sandbox = MockSandbox(
-        mock_apis=spec.get("mock_apis", {}),
-        task_id=spec["task_id"],            # 干净的 task_id，不再拼接 sample_id
-        sample_id=sample["sample_id"],
-        agent_id=spec["agent_id"],
-        prompt_version=spec.get("prompt_version", "v1"),
-        tool_definitions=spec.get("tools", []),
-    )
-
-    # ── 驱动被测 Agent ────────────────────────────────────────────────────────
-    if mock_run:
-        trace = _mock_agent_run(spec, sample, sandbox, trial_id)
-    else:
-        loop = AgentLoop(
-            model=os.getenv("EVAL_MODEL", "gpt-4o-mini"),
-            tools=spec.get("tools", []),
-            strategy=spec.get("strategy", "function_calling"),
-            max_steps=spec.get("max_steps", 10),
-        )
-        prompt = (f"{spec.get('agent_prompt', '')}\n\n"
-                  f"当前任务输入：{json.dumps(sample['input'], ensure_ascii=False)}")
-        trace = loop.run(prompt, sandbox)
-
-    # ── 双层评分 ──────────────────────────────────────────────────────────────
-    gt = dict(sample.get("ground_truth", {}))
-    gt.setdefault("input_content", sample.get("input", {}).get("content", ""))
-
-    result = scorer.score(trace, ground_truth=gt,
-                          expected_behavior=sample.get("expected_behavior", ""))
-    res_dict = result.to_dict()
-    res_dict["sample_id"] = sample["sample_id"]
-    res_dict["trial_id"] = trial_id
-
-    # ── 双模型交叉校验（可选）：分歧取保守分，仲裁结果回写 judge 分与总分 ──────
-    if cross_validator and not mock_run:
-        rec = cross_validator.validate(
-            sample_id=f"{sample['sample_id']}_t{trial_id}",
-            text=trace.final_output,
-            rubric=spec.get("scoring", {}).get("judge_rubric", ""),
-            reference=str(gt),
-        )
-        cross = rec.to_dict()
-        # merged_score：一致取均值、分歧取保守（较低分），避免高估 Agent 能力
-        if scorer.w_judge > 0:
-            merged = rec.merged_score
-            rule_score = res_dict.get("rule_score", 0.0)
-            new_final = scorer.w_rule * rule_score + scorer.w_judge * merged
-            res_dict["judge_score"] = round(merged, 4)
-            res_dict["overall_score"] = round(new_final, 4)
-            res_dict["judge_detail"] = {
-                "mode": "cross_check",
-                "score": round(merged, 4),
-                "disputed": not rec.agreed,
-            }
-            if new_final < scorer.pass_threshold and not res_dict.get("failure_reason"):
-                res_dict["failure_reason"] = "LLM_JUDGE_FAIL"
-        res_dict["cross_check"] = cross
-
-    trace.eval_result = res_dict
-    trace.failure_reason = res_dict.get("failure_reason")
-
-    # ── 终端输出 ──────────────────────────────────────────────────────────────
-    score = res_dict["overall_score"]
-    mark = "[green]✅[/]" if score >= scorer.pass_threshold else "[red]❌[/]"
-    reason = res_dict.get("failure_reason") or "ok"
-    console.print(
-        f"    {mark} trial{trial_id}  final={score:.3f}  "
-        f"[dim](rule={res_dict['rule_score']:.2f} judge={res_dict['judge_score']:.2f})[/]  "
-        f"[yellow]{reason}[/]"
-    )
-    if res_dict.get("rule_detail", {}).get("failed"):
-        for f in res_dict["rule_detail"]["failed"][:2]:
-            console.print(f"        [dim]↳ {f['name']}: {f['detail']}[/]")
-
-    return trace, res_dict
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CLI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_judge(backend: str, model: str | None, mode: str = "numeric"):
-    """
-    按后端构造 judge：
-      openai → LLMJudge（OpenAI API 调用，model 生效）
-      claude / codex → CLIJudge（CLI 子进程调用，model 由 CLI 自身决定）
-    """
-    if backend == "openai":
-        return LLMJudge(mode=mode, judge_model=model)
-    return CLIJudge(backend=backend, mode=mode)
-
-
-def select_ci_metric(aggregation: dict, reporter_data: dict, metric: str) -> tuple[float, str]:
-    """统一 CI 口径：Pass^k 衡量稳定性，Pass@k 衡量能力上界。"""
-    metric_map = {
-        "pass_hat_k": ("mean_pass^k", "样本级 Pass^k"),
-        "pass_at_k": ("mean_pass@k", "样本级 Pass@k"),
-        "vote_at_k": ("mean_vote@k", "样本级 Vote@k"),
-    }
-    key, label = metric_map[metric]
-    if aggregation.get("total_samples"):
-        return aggregation.get(key, 0.0), f"{label}={aggregation.get(key, 0.0):.2f}"
-    value = reporter_data.get("pass_rate", 0.0)
-    return value, f"trial 级 pass_rate={value:.2f}"
-
-
-def load_regression_samples(golden: GoldenDataset, task_id: str,
-                            task_samples: list[dict]) -> list[dict]:
-    """将未修复 Golden Case 覆盖合并进本任务，保证下轮评测真实回放。"""
-    merged = {sample["sample_id"]: dict(sample) for sample in task_samples}
-    for case in golden.regression_cases():
-        if case.get("task_id") != task_id or not case.get("sample_id"):
-            continue
-        sample_id = case["sample_id"]
-        # Golden 快照优先：即使 YAML 后续删改了原样本，也不会丢失历史坏例。
-        merged[sample_id] = {
-            "sample_id": sample_id,
-            "difficulty": "regression",
-            "input": case.get("input", {}),
-            "ground_truth": case.get("ground_truth", {}),
-            "expected_behavior": case.get("expected_behavior", ""),
-            "regression_case_id": case.get("case_id"),
-        }
-    return list(merged.values())
 
 
 @click.command()

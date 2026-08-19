@@ -62,6 +62,15 @@ class AgentLoop:
     @property
     def client(self) -> OpenAI:
         if self._client is None:
+            # 启动时显式探测 API Key（而非等 OpenAI SDK 抛 401）：缺 Key 时
+            # 给出可操作的错误信息，主循环 catch 后归因 EXECUTION_ERROR 并透出提示。
+            if not self.api_key:
+                raise ValueError(
+                    "未配置 OPENAI_API_KEY，无法发起真实 LLM 调用。请任选其一：\n"
+                    "  1) 设置环境变量 OPENAI_API_KEY（或 OPENAI_BASE_URL 指向网关）；\n"
+                    "  2) 仅验证评测链路：使用 --mock-run；\n"
+                    "  3) 测试/注入场景：显式传 api_key 或直接赋值 loop._client。"
+                )
             self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         return self._client
 

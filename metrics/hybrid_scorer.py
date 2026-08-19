@@ -121,28 +121,24 @@ class HybridScorer:
         rule_score = rule_result.score()
         rule_detail = rule_result.to_dict()
 
-        # ── 短路：格式层直接挂掉，无需再花钱调 Judge ──────────────────────────
+        # ── 短路：规则层决定性失败，不再花钱调 Judge ──────────────────────────
+        # 两类短路共用一条返回路径：
+        #   1. critical 一票否决（资损级）→ 规则分归零；
+        #   2. L1 格式/必填字段失败 → 保留规则层得分但总分判 0。
+        # 差异只在 rule_score 与 suggestion 上，归因/跳过标记一致。
         crit = rule_result.critical_failed()
-        if crit:
-            return HybridResult(
-                rule_score=0.0, judge_score=0.0, final_score=0.0,
-                rule_detail=rule_detail,
-                failure_reason=self._infer_reason(rule_result, 0.0),
-                suggestion="关键项失败（一票否决）：" + "；".join(
-                    f"{c.name} - {c.detail}" for c in crit),
-                judge_skipped=True,
-            )
-
-        # ── 短路 2：格式层挂掉，无需再花钱调 Judge ──────────────────────────
         l1 = rule_detail.get("l1", {})
-        if l1.get("json_format") == 0 or l1.get("required_fields") == 0:
+        l1_failed = l1.get("json_format") == 0 or l1.get("required_fields") == 0
+        if crit or l1_failed:
             return HybridResult(
-                rule_score=rule_score,
+                rule_score=0.0 if crit else rule_score,
                 judge_score=0.0,
                 final_score=0.0,
                 rule_detail=rule_detail,
                 failure_reason=self._infer_reason(rule_result, 0.0),
-                suggestion=self._build_suggestion(rule_result, 0.0),
+                suggestion=("关键项失败（一票否决）：" + "；".join(
+                    f"{c.name} - {c.detail}" for c in crit))
+                if crit else self._build_suggestion(rule_result, 0.0),
                 judge_skipped=True,
             )
 

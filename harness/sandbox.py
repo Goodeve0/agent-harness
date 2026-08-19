@@ -8,6 +8,7 @@ MockSandbox：工具调用拦截 + 全链路 Trace 记录
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 import uuid
@@ -52,7 +53,8 @@ class AgentTrace:
     is_bad_case: bool = False
 
     def add_step(self, tool_name: str, params: dict, response: Any,
-                 latency_ms: float = 0.0, error: str | None = None) -> ToolCall:
+                 latency_ms: float = 0.0, error: str | None = None,
+                 is_mock: bool = True) -> ToolCall:
         step = ToolCall(
             step=len(self.steps) + 1,
             tool_name=tool_name,
@@ -60,6 +62,7 @@ class AgentTrace:
             response=response,
             latency_ms=latency_ms,
             error=error,
+            is_mock=is_mock,
         )
         self.steps.append(step)
         return step
@@ -82,6 +85,7 @@ class AgentTrace:
                     "params": s.params,
                     "response": s.response,
                     "latency_ms": round(s.latency_ms, 2),
+                    "is_mock": s.is_mock,
                     "error": s.error,
                 }
                 for s in self.steps
@@ -136,7 +140,10 @@ class MockSandbox:
         else:
             mock = self._mock_apis[tool_name]
             try:
-                response = mock(params) if callable(mock) else mock
+                # deepcopy 返回值：非 callable 的 mock 值（及 _conditional matcher
+                # 返回的内部 dict）是共享引用，若被测 Agent 修改 response 会污染
+                # 后续调用与 YAML 声明，评测结果不可复现。返回副本后修改只影响本次。
+                response = copy.deepcopy(mock(params) if callable(mock) else mock)
             except Exception as e:
                 error = str(e)
                 response = {"error": error}

@@ -4,8 +4,10 @@
 
 | 层 | 文件 | 行数 |
 |---|---|---|
-| 入口 | run_eval.py | 552 |
-| Harness | harness/agent_loop.py, harness/sandbox.py | 372 |
+| 入口 | run_eval.py（CLI 壳，P3-1 已拆分） | 206 |
+| 编排 | harness/pipeline.py（trial/回归/Judge 工厂/CI 口径，P3-1 新增） | 126 |
+| Mock Agent | harness/mock_agent.py（P3-1 新增） | 158 |
+| Harness | harness/agent_loop.py, harness/sandbox.py | 386 |
 | Strategies | strategies/base.py, function_calling.py, react.py | 171 |
 | Metrics | rule_checker, hybrid_scorer, judge, cli_judge, cross_validator, aggregators | 1270 |
 | Data | dataset/tracer.py | 230 |
@@ -13,9 +15,9 @@
 | Tasks | tasks/content_pipeline, customer_service | 2 YAML |
 | Tests | tests/ 下 5 个文件 | 805 |
 
-**验证方式**：全量读码 + `pytest -q`（108 passed）+ `compileall` 全绿。
+**验证方式**：全量读码 + `pytest -q`（114 passed）+ `compileall` 全绿 + `run_eval.py --mock-run` CLI 冒烟通过。
 
-**修复进展（2026-08-19）**：P1-1 / P1-2 / P2-1 / P2-2 / P2-3 / P2-4 已全部修复并补回归测试（`tests/test_fixes.py`，10 组用例），详见文末「五、修复记录」。
+**修复进展（2026-08-19）**：P1-1 / P1-2 / P2-1 / P2-2 / P2-3 / P2-4 已全部修复并补回归测试（`tests/test_fixes.py`，10 组用例），详见文末「五、修复记录」；P3-1 ~ P3-6 优化项已全部完成，详见「六、P3 优化记录」。
 
 ---
 
@@ -72,7 +74,7 @@
 > `tests/test_fixes.py` 补齐：空记录 report() 键完整性、Trace messages 回放、`_parse_numeric` 15 组分制用例、ReAct 多行/嵌套 JSON 提取、格式漂移纠错循环集成（恢复 / 达上限归因 FORMAT_ERROR / 步数耗尽仍归因 MAX_STEPS_EXCEEDED）。
 - 正是 P1-1 未被测试发现的原因。建议补：`CrossValidator.report()` 全无效记录、`parse_cli_score` 各种边界、`extract_action` 多行 JSON/畸形输出、sandbox `_conditional` 条件 mock。
 
-### 🟢 P3（优化建议）
+### 🟢 P3（优化建议）✅ 已全部修复（2026-08-19，详见「六」）
 
 - **P3-1** `run_eval.py` 552 行承担 CLI + mock agent + 注入调度 + trial 执行 + 回归合并 + CI 口径，建议按职责拆分（cli.py / mock_agent.py / pipeline.py）。
 - **P3-2** `MockSandbox.call_tool` 对非 callable mock 值返回同一对象引用，若被测 Agent 修改 response 会污染后续调用（低风险，可 copy.deepcopy）。
@@ -100,9 +102,9 @@
 
 ## 四、结论
 
-项目整体质量良好：架构、注释、测试都在线，修复后 **108 测试全绿**，适合作为可扩展的评测基础设施继续演进。
+项目整体质量良好：架构、注释、测试都在线，修复后 **114 测试全绿**，适合作为可扩展的评测基础设施继续演进。
 
-**本轮已修复**：P1-1（KeyError crash）、P1-2（messages 落盘）、P2-1（格式漂移失败信号）、P2-2（数值解析死代码/分制推断）、P2-3（ReAct 跨行 JSON 截断）、P2-4（回归测试补齐）。剩余 P3 优化项不阻塞使用，可按需推进。
+**本轮已修复**：P1-1（KeyError crash）、P1-2（messages 落盘）、P2-1（格式漂移失败信号）、P2-2（数值解析死代码/分制推断）、P2-3（ReAct 跨行 JSON 截断）、P2-4（回归测试补齐）；P3-1 ~ P3-6（run_eval 拆分、mock 响应 deepcopy、is_mock 序列化、短路合并、报告口径、API Key 探测）亦已完成。
 
 **未发现**：密钥硬编码、SQL 注入面（无 DB）、XSS 面（无前端渲染用户输入）、路径穿越风险。
 
@@ -121,3 +123,19 @@
 | — | 附加 | `AgentLoop` 客户端惰性化（构造不强制 API Key，首次 `run()` 才建），便于装配与测试注入；修复 docstring 非法转义 `\{` 的 SyntaxWarning | `harness/agent_loop.py`、`strategies/react.py` |
 
 **业界参照**：OpenAI Evals trace 记录完整对话（input + 每步 reasoning/tool_call/result）→ 对应 P1-2；生产级 extract_score 普遍"正则提取 + clamp + 分制推断"→ 对应 P2-2；LangChain ReAct 用 OutputParserException 把解析错误反馈给模型重试（有限次）→ 对应 P2-1。
+
+---
+
+## 六、P3 优化记录（2026-08-19）
+
+| 编号 | 问题 | 修复方案 | 涉及文件 |
+|---|---|---|---|
+| P3-1 | run_eval.py 552 行职责过载 | 按职责拆分：CLI 壳（参数解析/主流程编排）留在 `run_eval.py`（206 行）；trial 执行/回归合并/Judge 工厂/CI 口径 → 新增 `harness/pipeline.py`；Mock Agent 注入逻辑 → 新增 `harness/mock_agent.py`。`run_eval.py` 保留 `_build_judge` 等旧名字 re-export，`from run_eval import ...` 完全兼容 | `run_eval.py`、`harness/pipeline.py`、`harness/mock_agent.py` |
+| P3-2 | mock 响应共享引用污染 | `call_tool` 对返回结果统一 `copy.deepcopy`（含 `_conditional` matcher 返回的内部 dict），被测 Agent 修改 response 只影响本次调用与本次 trace | `harness/sandbox.py` |
+| P3-3 | `is_mock` 未序列化 | `to_dict()` steps 导出 `is_mock`；`add_step` 增加 `is_mock` 参数（默认 True），支持区分 mock/真实调用 | `harness/sandbox.py` |
+| P3-4 | 双短路逻辑重叠 | 合并为单一短路路径：`critical_failed() or L1 失败` → 统一返回。critical 一票否决 rule_score 归零 + 建议注明"一票否决"；L1 失败保留规则层得分——两分支差异保留，行为不变 | `metrics/hybrid_scorer.py` |
+| P3-5 | `total_samples` 实为 trial 数 | 口径显式区分：`total_trials` = trial 总数（主口径，terminal 与兼容读取优先）；`total_samples` = 按 `sample_id` 去重的真实样本数（异常分支缺 sample_id 时回退 trial 数），不再靠注释兼容 | `report/reporter.py` |
+| P3-6 | 缺 API Key 抛 401 | `client` property 首次构造前显式探测 `api_key`，缺失即抛 `ValueError` 给出三条可操作路径（设 env / --mock-run / 显式注入），主循环 catch 后归因 EXECUTION_ERROR 并透出友好提示 | `harness/agent_loop.py` |
+| — | 回归测试 | `tests/test_fixes.py` 第三轮追加 6 组用例：run_trial mock 冒烟、deepcopy 防污染（含 _conditional）、is_mock 序列化、短路合并（critical/L1 双路径）、报告口径、缺 Key 探测 | `tests/test_fixes.py` |
+
+**测试规模**：76（基线）→ 108（P1/P2 修复 + 旧用例恢复）→ **114**（P3 回归）全绿，零警告。
